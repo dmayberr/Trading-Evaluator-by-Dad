@@ -12,6 +12,12 @@ import numpy as np
 from datetime import datetime, timedelta
 import io
 
+from settings_manager import (
+    SettingsManager,
+    render_settings_sidebar,
+    initialize_settings_in_session_state,
+    save_current_ui_settings
+)
 from src.data_fetcher import fetch_equity_data, fetch_options_chain, get_current_price
 from src.strategies import ALL_STRATEGIES, EQUITY_STRATEGIES, OPTIONS_STRATEGIES
 from src.backtester import (
@@ -79,6 +85,13 @@ div[data-testid="stExpander"] { background-color: var(--bg-card); border: 1px so
 </style>
 """, unsafe_allow_html=True)
 
+# ============================================================
+# SETTINGS MANAGER INITIALIZATION
+# ============================================================
+if 'settings_manager' not in st.session_state:
+    st.session_state.settings_manager = SettingsManager()
+settings_mgr = st.session_state.settings_manager
+initialize_settings_in_session_state(settings_mgr)
 
 # ============================================================
 # HELPERS
@@ -244,7 +257,7 @@ with st.sidebar:
     mode = st.radio("Mode", ["Backtest", "Portfolio", "Optimize"], horizontal=True)
 
     with st.expander("💰 Capital & Sizing", expanded=False):
-        capital = st.number_input("Starting Capital ($)", value=100000, min_value=1000, step=5000)
+        capital = st.number_input("Starting Capital ($)", value=float(settings_mgr.get("default_initial_capital", 100000)), min_value=1000, step=5000)
         sizing_mode = st.selectbox("Position Sizing", ["Compound (Full Reinvest)", "Fixed (No Compounding)", "Fractional (Partial Reinvest)"])
         sizing_mode_key = {"Compound (Full Reinvest)": "compound", "Fixed (No Compounding)": "fixed", "Fractional (Partial Reinvest)": "fractional"}[sizing_mode]
         reinvest_pct = st.slider("Reinvest % of Profits", 10, 90, 50, 5) if sizing_mode_key == "fractional" else 50.0
@@ -255,14 +268,16 @@ with st.sidebar:
         commission_model = st.selectbox("Commission Model", ["Per Share", "Per Trade", "Percentage"])
         commission_model_key = {"Per Share": "per_share", "Per Trade": "per_trade", "Percentage": "percentage"}[commission_model]
         comm_help = {"Per Share": "$ per share each side", "Per Trade": "$ flat per trade each side", "Percentage": "% of trade value each side"}
-        commission = st.number_input(f"Commission ({comm_help[commission_model]})", value=0.00, min_value=0.0, step=0.01, format="%.2f")
+        commission = st.number_input(f"Commission ({comm_help[commission_model]})", value=float(settings_mgr.get("default_commission", 0.00)), min_value=0.0, step=0.01, format="%.2f")
 
     if mode in ["Backtest", "Optimize"]:
         with st.expander("📊 Data & Strategy", expanded=True):
-            ticker = st.text_input("Ticker", value="SPY").upper()
+            ticker = st.text_input("Ticker", value=settings_mgr.get("default_ticker", "SPY")).upper()
             c1, c2 = st.columns(2)
-            with c1: start_date = st.date_input("Start", value=datetime.now() - timedelta(days=365*2))
-            with c2: end_date = st.date_input("End", value=datetime.now())
+            default_start = datetime.strptime(settings_mgr.get("default_start_date", (datetime.now() - timedelta(days=365*2)).strftime("%Y-%m-%d")), "%Y-%m-%d").date()
+            default_end = datetime.strptime(settings_mgr.get("default_end_date", datetime.now().strftime("%Y-%m-%d")), "%Y-%m-%d").date()
+            with c1: start_date = st.date_input("Start", value=default_start)
+            with c2: end_date = st.date_input("End", value=default_end)
             interval = st.selectbox("Interval", ["1d", "1h", "5m", "15m", "30m", "1wk"], index=0)
             auto_adjust = st.checkbox("Adjusted Data (splits/dividends)", value=True,
                                        help="On = adjusted for splits & dividends (recommended). Off = raw prices.")
@@ -275,27 +290,56 @@ with st.sidebar:
     elif mode == "Portfolio":
         with st.expander("📊 Data Settings", expanded=True):
             c1, c2 = st.columns(2)
-            with c1: start_date = st.date_input("Start", value=datetime.now() - timedelta(days=365*2))
-            with c2: end_date = st.date_input("End", value=datetime.now())
+            default_start = datetime.strptime(settings_mgr.get("default_start_date", (datetime.now() - timedelta(days=365*2)).strftime("%Y-%m-%d")), "%Y-%m-%d").date()
+            default_end = datetime.strptime(settings_mgr.get("default_end_date", datetime.now().strftime("%Y-%m-%d")), "%Y-%m-%d").date()
+            with c1: start_date = st.date_input("Start", value=default_start)
+            with c2: end_date = st.date_input("End", value=default_end)
             interval = st.selectbox("Interval", ["1d", "1h", "5m", "15m", "30m", "1wk"], index=0)
             auto_adjust = st.checkbox("Adjusted Data", value=True)
             num_positions = st.slider("Positions", 1, 10, 3)
             port_benchmark = st.checkbox("Compare to Benchmark", value=True, key="port_bench")
             if port_benchmark:
-                port_benchmark_ticker = st.text_input("Benchmark Ticker", value="SPY", key="port_bench_tk").upper()
+                port_benchmark_ticker = st.text_input("Benchmark Ticker", value=settings_mgr.get("benchmark_ticker", "SPY"), key="port_bench_tk").upper()
 
     if mode in ["Backtest"]:
         with st.expander("🔬 Analysis Options", expanded=False):
             use_benchmark = st.checkbox("Compare to Benchmark", value=True)
             benchmark_src = st.selectbox("Benchmark Source", ["Ticker", "Upload CSV"], key="bsrc")
             if benchmark_src == "Ticker":
-                benchmark_ticker_input = st.text_input("Benchmark Ticker", value="SPY", key="bticker").upper()
+                benchmark_ticker_input = st.text_input("Benchmark Ticker", value=settings_mgr.get("benchmark_ticker", "SPY"), key="bticker").upper()
             rolling_window = st.slider("Rolling Metrics Window", 5, 50, 15, 1)
             run_mc = st.checkbox("🎲 Monte Carlo Simulation", value=False,
                                   help="Shuffle trade sequence 1,000 times to test robustness and Risk of Ruin")
 
     btn_labels = {"Backtest": "🚀 RUN", "Optimize": "🔬 OPTIMIZE", "Portfolio": "📂 RUN PORTFOLIO"}
     run_button = st.button(btn_labels[mode], use_container_width=True)
+
+    # Save Current as Default
+    st.markdown("---")
+    if st.button("💾 Save Current as Default Settings", use_container_width=True, type="primary"):
+        # Save common settings that are available in all modes
+        settings_mgr.set("default_initial_capital", capital)
+        settings_mgr.set("default_commission", commission)
+        settings_mgr.set("default_start_date", str(start_date))
+        settings_mgr.set("default_end_date", str(end_date))
+
+        # Save ticker if in Backtest or Optimize mode
+        if mode in ["Backtest", "Optimize"]:
+            settings_mgr.set("default_ticker", ticker)
+
+        # Save benchmark ticker if applicable
+        if mode == "Backtest" and use_benchmark and benchmark_src == "Ticker":
+            settings_mgr.set("benchmark_ticker", benchmark_ticker_input)
+        elif mode == "Portfolio" and port_benchmark:
+            settings_mgr.set("benchmark_ticker", port_benchmark_ticker)
+
+        if settings_mgr.save_settings():
+            st.success("✅ Settings saved as defaults!")
+        else:
+            st.error("Failed to save settings")
+
+    # Settings Management UI
+    render_settings_sidebar(settings_mgr)
 
 
 # Set defaults for analysis options if not in Backtest mode
