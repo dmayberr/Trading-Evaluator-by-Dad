@@ -182,18 +182,21 @@ def run_monte_carlo(
     max_trades_per_sim: int = 500,
 ) -> Dict[str, Any]:
     """
-    Shuffle trade P&L sequence to simulate alternate outcomes.
-    Returns distribution of final equity, max drawdowns, and risk of ruin.
+    Bootstrap Monte Carlo with compounding.
+    Instead of permuting the exact same trades, we RESAMPLE with replacement
+    from the observed trade returns. Each simulation draws n_trades returns
+    from the pool (some trades may repeat, others may be skipped).
+    Combined with compounding, this produces a true distribution of outcomes
+    where early big losses crush future equity and early big wins amplify it.
     """
     if not trades:
         return {"final_equities": [], "max_drawdowns": [], "risk_of_ruin": 0,
                 "median_equity": capital, "p5_equity": capital, "p95_equity": capital,
                 "equity_paths": np.array([])}
 
-    pnls = np.array([t.pnl for t in trades])
-    n_trades = min(len(pnls), max_trades_per_sim)
+    pct_returns = np.array([t.pnl_pct / 100 for t in trades])
+    n_trades = min(len(pct_returns), max_trades_per_sim)
 
-    # Cap simulations based on dataset to avoid memory issues
     n_simulations = min(n_simulations, 2000)
 
     final_equities = np.zeros(n_simulations)
@@ -201,23 +204,25 @@ def run_monte_carlo(
     ruin_count = 0
     ruin_threshold = capital * 0.1  # 90% loss = ruin
 
-    # Store a subset of paths for fan chart (max 200)
     n_paths_to_store = min(200, n_simulations)
     equity_paths = np.zeros((n_paths_to_store, n_trades + 1))
 
     for sim in range(n_simulations):
-        shuffled = np.random.permutation(pnls)[:n_trades]
+        # Bootstrap: sample WITH replacement from observed returns
+        sampled = np.random.choice(pct_returns, size=n_trades, replace=True)
+
+        # Compound sequentially
         equity_curve = np.zeros(n_trades + 1)
         equity_curve[0] = capital
 
         for j in range(n_trades):
-            equity_curve[j + 1] = equity_curve[j] + shuffled[j]
+            equity_curve[j + 1] = equity_curve[j] * (1 + sampled[j])
 
         final_equities[sim] = equity_curve[-1]
 
-        # Max drawdown
+        # Max drawdown for this path
         peak = np.maximum.accumulate(equity_curve)
-        dd = (equity_curve - peak) / np.where(peak > 0, peak, 1) * 100
+        dd = np.where(peak > 0, (equity_curve - peak) / peak * 100, 0)
         max_drawdowns[sim] = dd.min()
 
         if equity_curve.min() <= ruin_threshold:
