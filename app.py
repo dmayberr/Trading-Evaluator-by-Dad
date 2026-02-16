@@ -280,6 +280,9 @@ with st.sidebar:
             interval = st.selectbox("Interval", ["1d", "1h", "5m", "15m", "30m", "1wk"], index=0)
             auto_adjust = st.checkbox("Adjusted Data", value=True)
             num_positions = st.slider("Positions", 1, 10, 3)
+            port_benchmark = st.checkbox("Compare to Benchmark", value=True, key="port_bench")
+            if port_benchmark:
+                port_benchmark_ticker = st.text_input("Benchmark Ticker", value="SPY", key="port_bench_tk").upper()
 
     if mode in ["Backtest"]:
         with st.expander("🔬 Analysis Options", expanded=False):
@@ -539,7 +542,18 @@ if st.session_state.get("has_run", False):
                          [f"📌 {t}" for t in pr["per_ticker"]])
 
         with ptabs[0]:
-            st.plotly_chart(chart_portfolio_equity(pr["per_ticker"], pr["combined_equity"], capital), use_container_width=True)
+            # Fetch portfolio benchmark if enabled
+            port_bench_df = None
+            if mode == "Portfolio" and st.session_state.get("port_bench", True):
+                btk = st.session_state.get("port_bench_tk", "SPY") or "SPY"
+                port_bench_df = fetch_equity_data(btk.upper(), str(start_date), str(end_date), interval)
+
+            st.plotly_chart(chart_portfolio_equity(pr["per_ticker"], pr["combined_equity"], capital,
+                                                    benchmark_df=port_bench_df), use_container_width=True)
+            if port_bench_df is not None and not port_bench_df.empty:
+                bench_ret = ((port_bench_df["close"].iloc[-1] / port_bench_df["close"].iloc[0]) - 1) * 100
+                port_ret = pr["combined_metrics"]["total_return_pct"]
+                st.caption(f"Benchmark ({btk.upper()}): **{bench_ret:+.1f}%** | Portfolio: **{port_ret:+.1f}%** | Alpha: **{port_ret - bench_ret:+.1f}%**")
         with ptabs[1]:
             st.plotly_chart(chart_portfolio_comparison(pr["per_ticker"]), use_container_width=True)
             rows = []

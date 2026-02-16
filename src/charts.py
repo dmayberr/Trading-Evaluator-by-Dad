@@ -774,8 +774,9 @@ def chart_portfolio_equity(
     per_ticker: dict,
     combined_equity: pd.DataFrame,
     capital: float,
+    benchmark_df: pd.DataFrame = None,
 ) -> go.Figure:
-    """Portfolio equity overlay: each ticker + combined total."""
+    """Portfolio equity overlay: each ticker + combined total + optional benchmark."""
     fig = go.Figure()
 
     ticker_colors = [
@@ -799,6 +800,16 @@ def chart_portfolio_equity(
             y=combined_equity["equity"].values,
             name="PORTFOLIO", mode="lines",
             line=dict(color=COLORS["white"], width=3),
+        ))
+
+    # Benchmark buy-and-hold overlay
+    if benchmark_df is not None and not benchmark_df.empty:
+        bench_close = benchmark_df["close"] if "close" in benchmark_df.columns else benchmark_df.iloc[:, 0]
+        bench_equity = capital * (bench_close / bench_close.iloc[0])
+        fig.add_trace(go.Scatter(
+            x=bench_equity.index, y=bench_equity.values,
+            name="Benchmark (Buy & Hold)", mode="lines",
+            line=dict(color=COLORS["amber"], width=2, dash="dot"), opacity=0.8,
         ))
 
     fig.add_hline(y=capital, line_dash="dash", line_color=COLORS["muted"],
