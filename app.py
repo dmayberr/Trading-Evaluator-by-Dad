@@ -257,7 +257,7 @@ with st.sidebar:
     mode = st.radio("Mode", ["Backtest", "Portfolio", "Optimize"], horizontal=True)
 
     with st.expander("💰 Capital & Sizing", expanded=False):
-        capital = st.number_input("Starting Capital ($)", value=float(settings_mgr.get("default_initial_capital", 100000)), min_value=1000, step=5000)
+        capital = st.number_input("Starting Capital ($)", value=float(settings_mgr.get("default_initial_capital", 100000)), min_value=1000.0, step=5000.0)
         sizing_mode = st.selectbox("Position Sizing", ["Compound (Full Reinvest)", "Fixed (No Compounding)", "Fractional (Partial Reinvest)"])
         sizing_mode_key = {"Compound (Full Reinvest)": "compound", "Fixed (No Compounding)": "fixed", "Fractional (Partial Reinvest)": "fractional"}[sizing_mode]
         reinvest_pct = st.slider("Reinvest % of Profits", 10, 90, 50, 5) if sizing_mode_key == "fractional" else 50.0
