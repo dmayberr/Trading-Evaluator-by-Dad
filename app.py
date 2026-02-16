@@ -281,9 +281,26 @@ with st.sidebar:
             auto_adjust = st.checkbox("Adjusted Data", value=True)
             num_positions = st.slider("Positions", 1, 10, 3)
 
+    if mode in ["Backtest"]:
+        with st.expander("🔬 Analysis Options", expanded=False):
+            use_benchmark = st.checkbox("Compare to Benchmark", value=True)
+            benchmark_src = st.selectbox("Benchmark Source", ["Ticker", "Upload CSV"], key="bsrc")
+            if benchmark_src == "Ticker":
+                benchmark_ticker_input = st.text_input("Benchmark Ticker", value="SPY", key="bticker").upper()
+            rolling_window = st.slider("Rolling Metrics Window", 5, 50, 15, 1)
+            run_mc = st.checkbox("🎲 Monte Carlo Simulation", value=False,
+                                  help="Shuffle trade sequence 1,000 times to test robustness and Risk of Ruin")
+
     btn_labels = {"Backtest": "🚀 RUN", "Optimize": "🔬 OPTIMIZE", "Portfolio": "📂 RUN PORTFOLIO"}
     run_button = st.button(btn_labels[mode], use_container_width=True)
 
+
+# Set defaults for analysis options if not in Backtest mode
+if mode != "Backtest":
+    use_benchmark = False
+    benchmark_src = "Ticker"
+    rolling_window = 15
+    run_mc = False
 
 # ============================================================
 # MAIN CONTENT
@@ -312,19 +329,12 @@ if run_button:
         with rc3: take_profit = st.number_input("Take Profit %", value=0.0, min_value=0.0, max_value=50.0, step=0.5, format="%.1f") or None
         with rc4: trailing_stop = st.number_input("Trailing Stop %", value=0.0, min_value=0.0, max_value=15.0, step=0.5, format="%.1f") or None
 
-        # Analysis options row
-        ac1, ac2, ac3, ac4 = st.columns(4)
-        with ac1: use_benchmark = st.checkbox("Benchmark", value=True)
-        with ac2:
-            benchmark_src = st.selectbox("Bench Source", ["Ticker", "Upload CSV"], key="bsrc")
-        with ac3: rolling_window = st.slider("Rolling Window", 5, 50, 15, 1)
-        with ac4: run_mc = st.checkbox("Monte Carlo", value=False)
-
+        # Analysis options (sourced from sidebar)
         benchmark_df = None
         benchmark_ticker = ticker
         if use_benchmark:
             if benchmark_src == "Ticker":
-                benchmark_ticker = st.text_input("Benchmark Ticker", value="SPY", key="bticker").upper()
+                benchmark_ticker = benchmark_ticker_input
                 if benchmark_ticker != ticker:
                     with st.spinner(f"Fetching benchmark {benchmark_ticker}..."):
                         benchmark_df = fetch_equity_data(benchmark_ticker, str(start_date), str(end_date), interval)
