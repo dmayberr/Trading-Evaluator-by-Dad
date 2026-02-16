@@ -545,7 +545,9 @@ if st.session_state.get("has_run", False):
             rows = []
             for tk, d in pr["per_ticker"].items():
                 m = d["metrics"]
-                rows.append({"Ticker": tk, "Strategy": [c["strategy_name"] for c in portfolio_data if c["ticker"]==tk][0],
+                # Get strategy name from the trades (works with cached results)
+                strat_name = d["trades"][0].strategy if d["trades"] else "—"
+                rows.append({"Ticker": tk, "Strategy": strat_name,
                              "Alloc%": d["allocation_pct"], "P&L": f"${m['total_pnl']:,.0f}",
                              "Return": f"{m['total_return_pct']:.1f}%", "Win%": f"{m['win_rate']:.1f}%",
                              "Sharpe": f"{m['sharpe_ratio']:.2f}", "MaxDD": f"{m['max_drawdown_pct']:.1f}%"})
