@@ -302,10 +302,19 @@ if mode != "Backtest":
     rolling_window = 15
     run_mc = False
 
+# Track run state in session so results persist across widget interactions
+if run_button:
+    st.session_state["has_run"] = True
+    st.session_state["run_mode"] = mode
+
+# Reset if mode changed
+if st.session_state.get("run_mode") != mode:
+    st.session_state["has_run"] = False
+
 # ============================================================
 # MAIN CONTENT
 # ============================================================
-if run_button:
+if st.session_state.get("has_run", False):
     # ========================================
     # BACKTEST MODE
     # ========================================
@@ -498,17 +507,30 @@ if run_button:
         if abs(total_alloc - 100) > 0.5:
             st.warning(f"Total allocation: {total_alloc:.1f}% (should be ~100%)")
 
-        # Fetch & run
-        portfolio_data = []
-        with st.spinner("Fetching data..."):
-            for cfg in portfolio_ui:
-                d = fetch_equity_data(cfg["ticker"], str(start_date), str(end_date), interval)
-                if d.empty: st.warning(f"No data for {cfg['ticker']}"); continue
-                cfg["df"] = d; portfolio_data.append(cfg)
-        if not portfolio_data: st.error("No valid data."); st.stop()
+        # Build cache key from all portfolio inputs
+        port_cache_key = str([(c["ticker"], c["strategy_name"], str(c["params"]),
+                               c["allocation_pct"], c["stop_loss_pct"], c["take_profit_pct"],
+                               c["trailing_stop_pct"], c["commission"], c["slippage_pct"],
+                               c["commission_model"])
+                              for c in portfolio_ui]) + str((capital, sizing_mode_key, reinvest_pct,
+                              str(start_date), str(end_date), interval))
 
-        with st.spinner("Running portfolio backtest..."):
-            pr = run_portfolio_backtest(portfolio_data, capital, sizing_mode_key, reinvest_pct)
+        if st.session_state.get("port_cache_key") != port_cache_key or "port_results" not in st.session_state:
+            # Fetch & run
+            portfolio_data = []
+            with st.spinner("Fetching data..."):
+                for cfg in portfolio_ui:
+                    d = fetch_equity_data(cfg["ticker"], str(start_date), str(end_date), interval)
+                    if d.empty: st.warning(f"No data for {cfg['ticker']}"); continue
+                    cfg["df"] = d; portfolio_data.append(cfg)
+            if not portfolio_data: st.error("No valid data."); st.stop()
+
+            with st.spinner("Running portfolio backtest..."):
+                pr = run_portfolio_backtest(portfolio_data, capital, sizing_mode_key, reinvest_pct)
+            st.session_state["port_results"] = pr
+            st.session_state["port_cache_key"] = port_cache_key
+        else:
+            pr = st.session_state["port_results"]
 
         st.markdown('<div class="section-header">📈 Portfolio Results</div>', unsafe_allow_html=True)
         render_metrics_row(pr["combined_metrics"])
@@ -566,10 +588,6 @@ if run_button:
         with rc3: take_profit = st.number_input("TP %", value=0.0, min_value=0.0, max_value=50.0, step=0.5, format="%.1f", key="opt_tp") or None
         with rc4: trailing_stop = st.number_input("TS %", value=0.0, min_value=0.0, max_value=15.0, step=0.5, format="%.1f", key="opt_ts") or None
 
-        opt_metric = st.selectbox("Optimize By", ["total_pnl", "sharpe_ratio", "win_rate", "profit_factor",
-                                                    "total_return_pct", "sortino_ratio", "expectancy"],
-                                   format_func=lambda x: x.replace("_", " ").title())
-
         param_ranges = {}
         for pname, pc in strategy_config["params"].items():
             with st.expander(f"🔹 {pc['label']}"):
@@ -584,17 +602,39 @@ if run_button:
 
         total_combos = 1
         for v in param_ranges.values(): total_combos *= len(v)
-        st.info(f"Running **{total_combos}** combinations on **{ticker}**")
 
-        with st.spinner("Optimizing..."):
-            opt_results = run_optimization(df, strategy_name, param_ranges, capital, position_size,
-                                            stop_loss, take_profit, trailing_stop, commission,
-                                            opt_metric, sizing_mode_key, reinvest_pct, slippage_pct, commission_model_key)
+        # Build a cache key from the inputs that matter for the optimization run
+        opt_cache_key = (ticker, strategy_name, str(start_date), str(end_date), interval,
+                         str(param_ranges), capital, position_size, stop_loss, take_profit,
+                         trailing_stop, commission, sizing_mode_key, reinvest_pct,
+                         slippage_pct, commission_model_key)
+
+        # Only re-run optimization if inputs changed
+        if st.session_state.get("opt_cache_key") != opt_cache_key or "opt_results" not in st.session_state:
+            st.info(f"Running **{total_combos}** combinations on **{ticker}**")
+            with st.spinner("Optimizing..."):
+                opt_results = run_optimization(df, strategy_name, param_ranges, capital, position_size,
+                                                stop_loss, take_profit, trailing_stop, commission,
+                                                "total_pnl", sizing_mode_key, reinvest_pct, slippage_pct, commission_model_key)
+            st.session_state["opt_results"] = opt_results
+            st.session_state["opt_cache_key"] = opt_cache_key
+            st.session_state["opt_df"] = df
+        else:
+            opt_results = st.session_state["opt_results"]
+            df = st.session_state["opt_df"]
+
         if opt_results.empty: st.error("No results."); st.stop()
 
-        best = opt_results.iloc[0]
+        # Sort by selected metric (this is cheap and can change without re-running)
+        opt_metric = st.selectbox("Sort Results By", ["total_pnl", "sharpe_ratio", "win_rate", "profit_factor",
+                                                    "total_return_pct", "sortino_ratio", "expectancy"],
+                                   format_func=lambda x: x.replace("_", " ").title(), key="opt_metric")
+
+        sorted_results = opt_results.sort_values(opt_metric, ascending=False).reset_index(drop=True)
+        best = sorted_results.iloc[0]
         param_cols = list(strategy_config["params"].keys())
-        st.markdown(f'<div class="section-header">🏆 Best: {opt_metric.replace("_"," ").title()}</div>', unsafe_allow_html=True)
+
+        st.markdown(f'<div class="section-header">🏆 Best by {opt_metric.replace("_"," ").title()}</div>', unsafe_allow_html=True)
 
         bcols = st.columns(len(param_cols) + 4)
         for i, pn in enumerate(param_cols):
@@ -613,10 +653,10 @@ if run_button:
                 with h2: hy = st.selectbox("Y-Axis", [p for p in param_cols if p != hx])
                 hm = st.selectbox("Metric", ["total_pnl","sharpe_ratio","win_rate","profit_factor","max_drawdown_pct"],
                                    format_func=lambda x: x.replace("_"," ").title())
-                st.plotly_chart(chart_optimization_heatmap(opt_results, hx, hy, hm), use_container_width=True)
+                st.plotly_chart(chart_optimization_heatmap(sorted_results, hx, hy, hm), use_container_width=True)
         with ot[1]:
-            st.dataframe(opt_results, use_container_width=True, height=350)
-            buf = io.StringIO(); opt_results.to_csv(buf, index=False)
+            st.dataframe(sorted_results, use_container_width=True, height=350)
+            buf = io.StringIO(); sorted_results.to_csv(buf, index=False)
             st.download_button("📥 CSV", buf.getvalue(), f"{ticker}_optimization.csv", "text/csv")
 
         with ot[2]:
@@ -642,7 +682,7 @@ if run_button:
                 with pd.ExcelWriter(xbuf, engine="openpyxl") as w:
                     pd.DataFrame([{"Recipe": l} for l in recipe.split("\n")]).to_excel(w, sheet_name="Recipe", index=False)
                     trades_to_dataframe(bt).to_excel(w, sheet_name="Trades", index=False)
-                    opt_results.head(20).to_excel(w, sheet_name="Top 20", index=False)
+                    sorted_results.head(20).to_excel(w, sheet_name="Top 20", index=False)
                 st.download_button("📥 Full Package (.xlsx)", xbuf.getvalue(), f"{ticker}_package.xlsx",
                                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
