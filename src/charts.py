@@ -861,3 +861,115 @@ def chart_portfolio_comparison(per_ticker: dict) -> go.Figure:
         barmode="group", yaxis_title="Value",
     )
     return fig
+
+
+# ============================================================
+# MONTE CARLO CHARTS
+# ============================================================
+
+def chart_monte_carlo_fan(mc_results: dict, capital: float) -> go.Figure:
+    """Fan chart showing Monte Carlo simulation equity paths with confidence bands."""
+    paths = mc_results.get("equity_paths", np.array([]))
+    if paths.size == 0:
+        fig = go.Figure()
+        fig.update_layout(**LAYOUT_DEFAULTS, height=400, title_text="No simulation data")
+        return fig
+
+    n_paths, n_steps = paths.shape
+    x = list(range(n_steps))
+
+    fig = go.Figure()
+
+    # Plot subset of individual paths (faded)
+    max_display = min(100, n_paths)
+    for i in range(max_display):
+        fig.add_trace(go.Scatter(
+            x=x, y=paths[i], mode="lines",
+            line=dict(color=COLORS["cyan"], width=0.3),
+            opacity=0.15, showlegend=False, hoverinfo="skip",
+        ))
+
+    # Percentile bands
+    p5 = np.percentile(paths, 5, axis=0)
+    p25 = np.percentile(paths, 25, axis=0)
+    p50 = np.percentile(paths, 50, axis=0)
+    p75 = np.percentile(paths, 75, axis=0)
+    p95 = np.percentile(paths, 95, axis=0)
+
+    fig.add_trace(go.Scatter(x=x, y=p95, mode="lines", name="95th %ile",
+                              line=dict(color=COLORS["green"], width=1, dash="dot")))
+    fig.add_trace(go.Scatter(x=x, y=p75, mode="lines", name="75th %ile",
+                              line=dict(color=COLORS["green"], width=1),
+                              fill="tonexty", fillcolor="rgba(16,185,129,0.08)"))
+    fig.add_trace(go.Scatter(x=x, y=p50, mode="lines", name="Median",
+                              line=dict(color=COLORS["white"], width=2.5)))
+    fig.add_trace(go.Scatter(x=x, y=p25, mode="lines", name="25th %ile",
+                              line=dict(color=COLORS["red"], width=1),
+                              fill="tonexty", fillcolor="rgba(239,68,68,0.08)"))
+    fig.add_trace(go.Scatter(x=x, y=p5, mode="lines", name="5th %ile",
+                              line=dict(color=COLORS["red"], width=1, dash="dot")))
+
+    fig.add_hline(y=capital, line_dash="dash", line_color=COLORS["muted"])
+
+    fig.update_layout(
+        **LAYOUT_DEFAULTS, height=450,
+        title_text=f"Monte Carlo Simulation ({mc_results.get('n_simulations', 0)} runs)",
+        xaxis_title="Trade Sequence", yaxis_title="Equity ($)",
+    )
+    return fig
+
+
+def chart_monte_carlo_distribution(mc_results: dict, capital: float) -> go.Figure:
+    """Histogram of final equity outcomes from Monte Carlo."""
+    finals = mc_results.get("final_equities", [])
+    if len(finals) == 0:
+        return go.Figure()
+
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=finals, nbinsx=50,
+        marker=dict(color=COLORS["blue"], line=dict(color=COLORS["cyan"], width=0.5)),
+        opacity=0.8, name="Final Equity",
+    ))
+
+    fig.add_vline(x=capital, line_dash="dash", line_color=COLORS["muted"],
+                  annotation_text="Starting Capital")
+    fig.add_vline(x=mc_results.get("median_equity", capital), line_dash="dot",
+                  line_color=COLORS["amber"], annotation_text="Median")
+
+    fig.update_layout(
+        **LAYOUT_DEFAULTS, height=350,
+        title_text="Distribution of Final Equity",
+        xaxis_title="Final Equity ($)", yaxis_title="Frequency",
+    )
+    return fig
+
+
+# ============================================================
+# PORTFOLIO CORRELATION CHART
+# ============================================================
+
+def chart_correlation_heatmap(corr_df: pd.DataFrame) -> go.Figure:
+    """Correlation heatmap for portfolio positions."""
+    if corr_df.empty:
+        fig = go.Figure()
+        fig.update_layout(**LAYOUT_DEFAULTS, height=300, title_text="Need 2+ positions for correlation")
+        return fig
+
+    fig = go.Figure(data=go.Heatmap(
+        z=corr_df.values,
+        x=corr_df.columns.tolist(),
+        y=corr_df.index.tolist(),
+        colorscale=[[0, COLORS["blue"]], [0.5, COLORS["bg"]], [1, COLORS["red"]]],
+        zmid=0, zmin=-1, zmax=1,
+        text=[[f"{v:.2f}" for v in row] for row in corr_df.values],
+        texttemplate="%{text}",
+        textfont=dict(size=14, color=COLORS["white"]),
+        colorbar=dict(title="Correlation"),
+    ))
+
+    fig.update_layout(
+        **LAYOUT_DEFAULTS, height=350,
+        title_text="Portfolio Correlation (Daily Returns)",
+    )
+    return fig

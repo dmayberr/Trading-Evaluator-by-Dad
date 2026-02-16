@@ -1,7 +1,8 @@
 """
 Backtester Module
 Executes strategies, manages positions with risk controls, computes performance metrics.
-Supports multiple position sizing modes and multi-ticker portfolio backtesting.
+Supports: slippage, variable commissions, position sizing modes, Monte Carlo,
+walk-forward out-of-sample validation, and multi-ticker portfolio backtesting.
 """
 
 import pandas as pd
@@ -11,39 +12,51 @@ from src.strategies import Trade, SignalType, ALL_STRATEGIES
 
 
 # ============================================================
-# POSITION SIZING MODES
+# COMMISSION MODELS
+# ============================================================
+
+def calc_commission(
+    model: str,
+    shares: float,
+    price: float,
+    flat_rate: float = 0.0,
+) -> float:
+    """
+    Calculate round-trip commission based on model.
+    Models: 'per_share', 'per_trade', 'percentage'
+    flat_rate meaning varies:
+      per_share:  $ per share (applied each side)
+      per_trade:  $ per trade (applied each side)
+      percentage: % of trade value (applied each side)
+    """
+    if model == "per_trade":
+        return flat_rate * 2  # entry + exit
+    elif model == "percentage":
+        trade_value = shares * price
+        return trade_value * (flat_rate / 100) * 2
+    else:  # per_share (default)
+        return flat_rate * shares * 2
+
+
+# ============================================================
+# POSITION SIZING
 # ============================================================
 
 def calc_position_size(
-    mode: str,
-    equity: float,
-    capital: float,
-    price: float,
-    position_size_pct: float,
-    reinvest_pct: float = 50.0,
+    mode: str, equity: float, capital: float, price: float,
+    position_size_pct: float, reinvest_pct: float = 50.0,
 ) -> float:
-    """
-    Calculate number of shares based on sizing mode.
-
-    Modes:
-        'compound'   - Size based on current equity (full reinvest)
-        'fixed'      - Always size based on initial capital (no compounding)
-        'fractional' - Reinvest X% of profits, keep base from initial capital
-    """
     if mode == "fixed":
         base = capital * (position_size_pct / 100)
     elif mode == "fractional":
         profits = max(equity - capital, 0)
         reinvested = profits * (reinvest_pct / 100)
         base = (capital + reinvested) * (position_size_pct / 100)
-        # If in drawdown, use current equity
         if equity < capital:
             base = equity * (position_size_pct / 100)
-    else:  # compound (default)
+    else:
         base = equity * (position_size_pct / 100)
-
-    shares = base / price if price > 0 else 0
-    return shares
+    return base / price if price > 0 else 0
 
 
 # ============================================================
@@ -63,11 +76,9 @@ def run_backtest(
     sizing_mode: str = "compound",
     reinvest_pct: float = 50.0,
     ticker: str = "",
+    slippage_pct: float = 0.0,
+    commission_model: str = "per_share",
 ) -> Tuple[pd.DataFrame, List[Trade], pd.DataFrame]:
-    """
-    Run a full backtest with configurable position sizing.
-    Returns: (signal_df, trades_list, equity_curve_df)
-    """
     strategy_config = ALL_STRATEGIES.get(strategy_name)
     if not strategy_config:
         raise ValueError(f"Unknown strategy: {strategy_name}")
@@ -90,41 +101,37 @@ def run_backtest(
             lowest_since_entry = min(lowest_since_entry, current_price)
             exit_reason = ""
 
-            # Check stop loss
             if stop_loss_pct is not None:
                 sl_price = current_trade.entry_price * (1 - stop_loss_pct / 100)
                 if current_price <= sl_price:
                     exit_reason = "Stop Loss"
 
-            # Check take profit
             if not exit_reason and take_profit_pct is not None:
                 tp_price = current_trade.entry_price * (1 + take_profit_pct / 100)
                 if current_price >= tp_price:
                     exit_reason = "Take Profit"
 
-            # Check trailing stop
             if not exit_reason and trailing_stop_pct is not None:
                 ts_price = highest_since_entry * (1 - trailing_stop_pct / 100)
                 if current_price <= ts_price:
                     exit_reason = "Trailing Stop"
 
-            # Check signal exit
             if not exit_reason and row["signal"] == SignalType.LONG_EXIT.value:
                 exit_reason = "Signal"
 
-            # Force exit on last bar
             if not exit_reason and i == len(signal_df) - 1:
                 exit_reason = "End of Data"
 
             if exit_reason:
+                # Apply slippage to exit (worse price for seller)
+                exit_price = current_price * (1 - slippage_pct / 100)
                 current_trade.exit_date = date
-                current_trade.exit_price = current_price
-                pnl_gross = (current_price - current_trade.entry_price) * current_trade.shares
-                total_commission = commission * 2 * current_trade.shares
-                current_trade.pnl = pnl_gross - total_commission
-                current_trade.pnl_pct = ((current_price / current_trade.entry_price) - 1) * 100
+                current_trade.exit_price = exit_price
+                pnl_gross = (exit_price - current_trade.entry_price) * current_trade.shares
+                total_comm = calc_commission(commission_model, current_trade.shares, current_trade.entry_price, commission)
+                current_trade.pnl = pnl_gross - total_comm
+                current_trade.pnl_pct = ((exit_price / current_trade.entry_price) - 1) * 100
                 current_trade.exit_reason = exit_reason
-                # MAE / MFE as % from entry
                 current_trade.mae_pct = ((lowest_since_entry / current_trade.entry_price) - 1) * 100
                 current_trade.mfe_pct = ((highest_since_entry / current_trade.entry_price) - 1) * 100
                 equity += current_trade.pnl
@@ -134,19 +141,18 @@ def run_backtest(
                 current_trade = None
 
         elif row["signal"] == SignalType.LONG_ENTRY.value and not in_position:
+            # Apply slippage to entry (worse price for buyer)
+            entry_price = row["close"] * (1 + slippage_pct / 100)
             shares = calc_position_size(
-                sizing_mode, equity, capital, row["close"],
+                sizing_mode, equity, capital, entry_price,
                 position_size_pct, reinvest_pct
             )
             current_trade = Trade(
-                entry_date=date,
-                direction="long",
-                entry_price=row["close"],
-                shares=shares,
+                entry_date=date, direction="long",
+                entry_price=entry_price, shares=shares,
                 strategy=strategy_name,
             )
-            # Store ticker on trade for portfolio tracking
-            current_trade.option_type = ticker  # reuse field for ticker label
+            current_trade.option_type = ticker
             current_trade.equity_at_entry = equity
             highest_since_entry = row["close"]
             lowest_since_entry = row["close"]
@@ -166,7 +172,92 @@ def run_backtest(
 
 
 # ============================================================
-# PORTFOLIO BACKTEST (MULTI-TICKER)
+# MONTE CARLO SIMULATION
+# ============================================================
+
+def run_monte_carlo(
+    trades: List[Trade],
+    capital: float,
+    n_simulations: int = 1000,
+    max_trades_per_sim: int = 500,
+) -> Dict[str, Any]:
+    """
+    Shuffle trade P&L sequence to simulate alternate outcomes.
+    Returns distribution of final equity, max drawdowns, and risk of ruin.
+    """
+    if not trades:
+        return {"final_equities": [], "max_drawdowns": [], "risk_of_ruin": 0,
+                "median_equity": capital, "p5_equity": capital, "p95_equity": capital,
+                "equity_paths": np.array([])}
+
+    pnls = np.array([t.pnl for t in trades])
+    n_trades = min(len(pnls), max_trades_per_sim)
+
+    # Cap simulations based on dataset to avoid memory issues
+    n_simulations = min(n_simulations, 2000)
+
+    final_equities = np.zeros(n_simulations)
+    max_drawdowns = np.zeros(n_simulations)
+    ruin_count = 0
+    ruin_threshold = capital * 0.1  # 90% loss = ruin
+
+    # Store a subset of paths for fan chart (max 200)
+    n_paths_to_store = min(200, n_simulations)
+    equity_paths = np.zeros((n_paths_to_store, n_trades + 1))
+
+    for sim in range(n_simulations):
+        shuffled = np.random.permutation(pnls)[:n_trades]
+        equity_curve = np.zeros(n_trades + 1)
+        equity_curve[0] = capital
+
+        for j in range(n_trades):
+            equity_curve[j + 1] = equity_curve[j] + shuffled[j]
+
+        final_equities[sim] = equity_curve[-1]
+
+        # Max drawdown
+        peak = np.maximum.accumulate(equity_curve)
+        dd = (equity_curve - peak) / np.where(peak > 0, peak, 1) * 100
+        max_drawdowns[sim] = dd.min()
+
+        if equity_curve.min() <= ruin_threshold:
+            ruin_count += 1
+
+        if sim < n_paths_to_store:
+            equity_paths[sim] = equity_curve
+
+    return {
+        "final_equities": final_equities,
+        "max_drawdowns": max_drawdowns,
+        "risk_of_ruin": (ruin_count / n_simulations) * 100,
+        "median_equity": float(np.median(final_equities)),
+        "p5_equity": float(np.percentile(final_equities, 5)),
+        "p95_equity": float(np.percentile(final_equities, 95)),
+        "p25_equity": float(np.percentile(final_equities, 25)),
+        "p75_equity": float(np.percentile(final_equities, 75)),
+        "mean_max_dd": float(np.mean(max_drawdowns)),
+        "equity_paths": equity_paths,
+        "n_simulations": n_simulations,
+        "n_trades": n_trades,
+    }
+
+
+# ============================================================
+# WALK-FORWARD (OUT-OF-SAMPLE) SPLIT
+# ============================================================
+
+def split_walk_forward(
+    df: pd.DataFrame,
+    in_sample_pct: float = 70.0,
+) -> Tuple[pd.DataFrame, pd.DataFrame, Any]:
+    """Split data into in-sample and out-of-sample portions."""
+    split_idx = int(len(df) * (in_sample_pct / 100))
+    split_date = df.index[split_idx]
+    return df.iloc[:split_idx], df.iloc[split_idx:], split_date
+
+
+# ============================================================
+# PORTFOLIO BACKTEST
 # ============================================================
 
 def run_portfolio_backtest(
@@ -175,24 +266,6 @@ def run_portfolio_backtest(
     sizing_mode: str = "compound",
     reinvest_pct: float = 50.0,
 ) -> Dict[str, Any]:
-    """
-    Run backtests across multiple tickers with capital allocation.
-
-    portfolio_configs: list of dicts, each with:
-        {
-            "ticker": str,
-            "df": pd.DataFrame,
-            "strategy_name": str,
-            "params": dict,
-            "allocation_pct": float,  # % of capital allocated
-            "stop_loss_pct": float or None,
-            "take_profit_pct": float or None,
-            "trailing_stop_pct": float or None,
-            "commission": float,
-        }
-
-    Returns dict with per-ticker results and combined portfolio metrics.
-    """
     results = {}
     all_trades = []
     equity_curves = {}
@@ -207,7 +280,7 @@ def run_portfolio_backtest(
             strategy_name=config["strategy_name"],
             params=config["params"],
             capital=ticker_capital,
-            position_size_pct=100.0,  # 100% of allocated capital
+            position_size_pct=100.0,
             stop_loss_pct=config.get("stop_loss_pct"),
             take_profit_pct=config.get("take_profit_pct"),
             trailing_stop_pct=config.get("trailing_stop_pct"),
@@ -215,47 +288,50 @@ def run_portfolio_backtest(
             sizing_mode=sizing_mode,
             reinvest_pct=reinvest_pct,
             ticker=ticker,
+            slippage_pct=config.get("slippage_pct", 0.0),
+            commission_model=config.get("commission_model", "per_share"),
         )
 
         metrics = compute_metrics(trades, equity_df, ticker_capital)
-
         results[ticker] = {
-            "signal_df": signal_df,
-            "trades": trades,
-            "equity_df": equity_df,
-            "metrics": metrics,
-            "allocation_pct": alloc,
-            "capital": ticker_capital,
+            "signal_df": signal_df, "trades": trades, "equity_df": equity_df,
+            "metrics": metrics, "allocation_pct": alloc, "capital": ticker_capital,
         }
-
-        # Tag trades with ticker
         for t in trades:
             t.option_type = ticker
         all_trades.extend(trades)
-
         equity_curves[ticker] = equity_df["equity"]
 
-    # Build combined portfolio equity curve
     combined_equity = _combine_equity_curves(equity_curves, capital)
     combined_metrics = compute_metrics(all_trades, combined_equity, capital)
 
+    # Portfolio correlation
+    correlation = _compute_portfolio_correlation(equity_curves)
+
     return {
-        "per_ticker": results,
-        "combined_trades": all_trades,
-        "combined_equity": combined_equity,
-        "combined_metrics": combined_metrics,
+        "per_ticker": results, "combined_trades": all_trades,
+        "combined_equity": combined_equity, "combined_metrics": combined_metrics,
+        "correlation": correlation,
     }
 
 
 def _combine_equity_curves(curves: Dict[str, pd.Series], capital: float) -> pd.DataFrame:
-    """Merge per-ticker equity curves into a single portfolio equity curve."""
     if not curves:
         return pd.DataFrame(columns=["equity"])
-
     combined = pd.DataFrame(curves)
     combined = combined.ffill().bfill()
     combined["equity"] = combined.sum(axis=1)
     return combined[["equity"]]
+
+
+def _compute_portfolio_correlation(curves: Dict[str, pd.Series]) -> pd.DataFrame:
+    """Compute correlation matrix of daily returns across tickers."""
+    if len(curves) < 2:
+        return pd.DataFrame()
+    returns = pd.DataFrame()
+    for ticker, eq in curves.items():
+        returns[ticker] = eq.pct_change().dropna()
+    return returns.corr()
 
 
 # ============================================================
@@ -263,37 +339,21 @@ def _combine_equity_curves(curves: Dict[str, pd.Series], capital: float) -> pd.D
 # ============================================================
 
 def compute_metrics(trades: List[Trade], equity_df: pd.DataFrame, capital: float) -> Dict[str, Any]:
-    """Compute comprehensive performance metrics from trade results."""
     if not trades:
-        return {
-            "total_trades": 0,
-            "win_rate": 0.0,
-            "total_pnl": 0.0,
-            "total_return_pct": 0.0,
-            "avg_pnl": 0.0,
-            "avg_win": 0.0,
-            "avg_loss": 0.0,
-            "max_win": 0.0,
-            "max_loss": 0.0,
-            "profit_factor": 0.0,
-            "expectancy": 0.0,
-            "max_drawdown_pct": 0.0,
-            "sharpe_ratio": 0.0,
-            "sortino_ratio": 0.0,
-            "calmar_ratio": 0.0,
-            "avg_hold_days": 0,
-            "max_consecutive_wins": 0,
-            "max_consecutive_losses": 0,
-            "win_loss_ratio": 0.0,
-        }
+        return {k: 0 for k in [
+            "total_trades", "win_rate", "total_pnl", "total_return_pct",
+            "avg_pnl", "avg_win", "avg_loss", "max_win", "max_loss",
+            "profit_factor", "expectancy", "max_drawdown_pct", "sharpe_ratio",
+            "sortino_ratio", "calmar_ratio", "avg_hold_days",
+            "max_consecutive_wins", "max_consecutive_losses", "win_loss_ratio",
+        ]}
 
     pnls = [t.pnl for t in trades]
     winners = [p for p in pnls if p > 0]
     losers = [p for p in pnls if p <= 0]
     total_pnl = sum(pnls)
-    win_rate = len(winners) / len(trades) * 100 if trades else 0
+    win_rate = len(winners) / len(trades) * 100
 
-    # Hold durations
     hold_days = []
     for t in trades:
         if t.entry_date is not None and t.exit_date is not None:
@@ -303,7 +363,6 @@ def compute_metrics(trades: List[Trade], equity_df: pd.DataFrame, capital: float
             except:
                 hold_days.append(0)
 
-    # Max drawdown
     if not equity_df.empty:
         eq = equity_df["equity"] if "equity" in equity_df.columns else equity_df.iloc[:, 0]
         peak = eq.expanding().max()
@@ -312,70 +371,49 @@ def compute_metrics(trades: List[Trade], equity_df: pd.DataFrame, capital: float
     else:
         max_dd = 0.0
 
-    # Daily returns for Sharpe/Sortino
     if not equity_df.empty and len(equity_df) > 1:
         eq = equity_df["equity"] if "equity" in equity_df.columns else equity_df.iloc[:, 0]
         daily_returns = eq.pct_change().dropna()
-        avg_daily_return = daily_returns.mean()
-        std_daily_return = daily_returns.std()
-        downside_returns = daily_returns[daily_returns < 0]
-        downside_std = downside_returns.std() if len(downside_returns) > 0 else 0.001
-
-        sharpe = (avg_daily_return / std_daily_return * np.sqrt(252)) if std_daily_return > 0 else 0
-        sortino = (avg_daily_return / downside_std * np.sqrt(252)) if downside_std > 0 else 0
+        avg_dr = daily_returns.mean()
+        std_dr = daily_returns.std()
+        down_ret = daily_returns[daily_returns < 0]
+        down_std = down_ret.std() if len(down_ret) > 0 else 0.001
+        sharpe = (avg_dr / std_dr * np.sqrt(252)) if std_dr > 0 else 0
+        sortino = (avg_dr / down_std * np.sqrt(252)) if down_std > 0 else 0
     else:
-        sharpe = 0.0
-        sortino = 0.0
+        sharpe = sortino = 0.0
 
-    # Profit factor
     gross_profit = sum(winners) if winners else 0
     gross_loss = abs(sum(losers)) if losers else 0.001
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
-    # Consecutive wins/losses
-    max_consec_wins = 0
-    max_consec_losses = 0
-    current_wins = 0
-    current_losses = 0
+    max_cw = max_cl = cw = cl = 0
     for p in pnls:
         if p > 0:
-            current_wins += 1
-            current_losses = 0
-            max_consec_wins = max(max_consec_wins, current_wins)
+            cw += 1; cl = 0; max_cw = max(max_cw, cw)
         else:
-            current_losses += 1
-            current_wins = 0
-            max_consec_losses = max(max_consec_losses, current_losses)
+            cl += 1; cw = 0; max_cl = max(max_cl, cl)
 
-    # Expectancy
     avg_win = np.mean(winners) if winners else 0
-    avg_loss = abs(np.mean(losers)) if losers else 0.001
-    expectancy = (win_rate / 100 * avg_win) - ((1 - win_rate / 100) * avg_loss)
-
-    # Calmar ratio
+    avg_loss_val = abs(np.mean(losers)) if losers else 0.001
+    expectancy = (win_rate / 100 * avg_win) - ((1 - win_rate / 100) * avg_loss_val)
     total_return_pct = (total_pnl / capital) * 100
     calmar = total_return_pct / abs(max_dd) if max_dd != 0 else 0
 
     return {
-        "total_trades": len(trades),
-        "win_rate": round(win_rate, 2),
-        "total_pnl": round(total_pnl, 2),
-        "total_return_pct": round(total_return_pct, 2),
+        "total_trades": len(trades), "win_rate": round(win_rate, 2),
+        "total_pnl": round(total_pnl, 2), "total_return_pct": round(total_return_pct, 2),
         "avg_pnl": round(np.mean(pnls), 2),
         "avg_win": round(avg_win, 2),
         "avg_loss": round(-abs(np.mean(losers)) if losers else 0, 2),
-        "max_win": round(max(pnls), 2) if pnls else 0,
-        "max_loss": round(min(pnls), 2) if pnls else 0,
-        "profit_factor": round(profit_factor, 2),
-        "expectancy": round(expectancy, 2),
+        "max_win": round(max(pnls), 2), "max_loss": round(min(pnls), 2),
+        "profit_factor": round(profit_factor, 2), "expectancy": round(expectancy, 2),
         "max_drawdown_pct": round(max_dd, 2),
-        "sharpe_ratio": round(sharpe, 2),
-        "sortino_ratio": round(sortino, 2),
+        "sharpe_ratio": round(sharpe, 2), "sortino_ratio": round(sortino, 2),
         "calmar_ratio": round(calmar, 2),
         "avg_hold_days": round(np.mean(hold_days), 1) if hold_days else 0,
-        "max_consecutive_wins": max_consec_wins,
-        "max_consecutive_losses": max_consec_losses,
-        "win_loss_ratio": round(avg_win / avg_loss, 2) if avg_loss > 0 else 0,
+        "max_consecutive_wins": max_cw, "max_consecutive_losses": max_cl,
+        "win_loss_ratio": round(avg_win / avg_loss_val, 2) if avg_loss_val > 0 else 0,
     }
 
 
@@ -384,41 +422,29 @@ def compute_metrics(trades: List[Trade], equity_df: pd.DataFrame, capital: float
 # ============================================================
 
 def run_optimization(
-    df: pd.DataFrame,
-    strategy_name: str,
-    param_ranges: Dict[str, list],
-    capital: float = 100000.0,
-    position_size_pct: float = 100.0,
-    stop_loss_pct: Optional[float] = None,
-    take_profit_pct: Optional[float] = None,
-    trailing_stop_pct: Optional[float] = None,
-    commission: float = 0.0,
-    optimize_by: str = "total_pnl",
-    sizing_mode: str = "compound",
-    reinvest_pct: float = 50.0,
+    df: pd.DataFrame, strategy_name: str, param_ranges: Dict[str, list],
+    capital: float = 100000.0, position_size_pct: float = 100.0,
+    stop_loss_pct=None, take_profit_pct=None, trailing_stop_pct=None,
+    commission: float = 0.0, optimize_by: str = "total_pnl",
+    sizing_mode: str = "compound", reinvest_pct: float = 50.0,
+    slippage_pct: float = 0.0, commission_model: str = "per_share",
 ) -> pd.DataFrame:
-    """
-    Parameter sweep optimization.
-    """
     from itertools import product
-
     param_names = list(param_ranges.keys())
-    param_values = list(param_ranges.values())
-    all_combos = list(product(*param_values))
+    all_combos = list(product(*param_ranges.values()))
 
     results = []
     for combo in all_combos:
         params = dict(zip(param_names, combo))
         try:
             _, trades, equity_df = run_backtest(
-                df, strategy_name, params, capital,
-                position_size_pct, stop_loss_pct, take_profit_pct,
-                trailing_stop_pct, commission, sizing_mode, reinvest_pct
+                df, strategy_name, params, capital, position_size_pct,
+                stop_loss_pct, take_profit_pct, trailing_stop_pct,
+                commission, sizing_mode, reinvest_pct, "", slippage_pct, commission_model
             )
             metrics = compute_metrics(trades, equity_df, capital)
-            row = {**params, **metrics}
-            results.append(row)
-        except Exception:
+            results.append({**params, **metrics})
+        except:
             continue
 
     results_df = pd.DataFrame(results)
@@ -432,26 +458,20 @@ def run_optimization(
 # ============================================================
 
 def trades_to_dataframe(trades: List[Trade], include_ticker: bool = False) -> pd.DataFrame:
-    """Convert list of Trade objects to a clean DataFrame."""
     if not trades:
         return pd.DataFrame()
-
     records = []
     for t in trades:
         row = {}
         if include_ticker:
-            row["Ticker"] = t.option_type  # ticker stored here
+            row["Ticker"] = t.option_type
         row.update({
-            "Entry Date": t.entry_date,
-            "Exit Date": t.exit_date,
+            "Entry Date": t.entry_date, "Exit Date": t.exit_date,
             "Direction": t.direction,
-            "Entry Price": round(t.entry_price, 2),
-            "Exit Price": round(t.exit_price, 2),
+            "Entry Price": round(t.entry_price, 2), "Exit Price": round(t.exit_price, 2),
             "Shares": round(t.shares, 2),
-            "P&L ($)": round(t.pnl, 2),
-            "P&L (%)": round(t.pnl_pct, 2),
-            "MAE (%)": round(t.mae_pct, 2),
-            "MFE (%)": round(t.mfe_pct, 2),
+            "P&L ($)": round(t.pnl, 2), "P&L (%)": round(t.pnl_pct, 2),
+            "MAE (%)": round(t.mae_pct, 2), "MFE (%)": round(t.mfe_pct, 2),
             "Exit Reason": t.exit_reason,
         })
         records.append(row)
